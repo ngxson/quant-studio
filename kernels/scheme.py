@@ -218,6 +218,14 @@ def tensor_get_category(name: str) -> Category:
     return Category.OTHER
 
 
+def weight_name_key(name: str) -> tuple[int, str]:
+    """llama_model_loader's weight_name_comparer: order by blk layer number, then name.
+    The loader processes and writes tensors in this order, and the counter-based
+    mixture rules depend on it, so the driver must iterate the same way."""
+    m = re.match(r"blk\.(\d+)\.", name)
+    return (int(m.group(1)) if m else -1, name)
+
+
 def category_is_attn_v(cat: Category) -> bool:
     """Attention-v-like tensors, more sensitive to quantization."""
     return cat in (Category.ATTENTION_V, Category.ATTENTION_QKV, Category.ATTENTION_KV_B)

@@ -358,15 +358,17 @@ def main() -> None:
         sys.exit("error: input has no general.architecture key")
     arch = arch_field.contents()
 
-    # decide the target type + kernel for every tensor with the llama-quant.cpp logic
+    # decide the target type + kernel for every tensor with the llama-quant.cpp logic;
+    # process and write in llama_model_loader order, which the counter-based rules depend on
+    tensors = sorted(reader.tensors, key=lambda t: scheme.weight_name_key(t.name))
     model = scheme.ModelInfo.from_reader(reader)
-    qs = scheme.init_state(model, [t.name for t in reader.tensors], bool(imatrix), tt_overrides)
+    qs = scheme.init_state(model, [t.name for t in tensors], bool(imatrix), tt_overrides)
     spec_by_type = {s.ggml_type: s for s in QUANT_TYPES.values()}
 
     plans = []  # (tensor, dst_type|None, spec|None)
     missing: dict[str, list[str]] = {}
     need_imat: list[str] = []
-    for tensor in reader.tensors:
+    for tensor in tensors:
         src = tensor.tensor_type
         dst = src
         if src in TORCH_DTYPES:  # requantizing an already-quantized source is rejected above
