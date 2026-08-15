@@ -1,6 +1,6 @@
-"""Q4_K quantization: port of quantize_row_q4_K_ref() / quantize_row_q4_K_impl() from ggml-quants.c.
+"""Q5_K quantization: port of quantize_row_q5_K_ref() / quantize_row_q5_K_impl() from ggml-quants.c.
 
-Matches the quantize_q4_K() dispatch: without an imatrix the _ref path (make_qkx2_quants),
+Matches the quantize_q5_K() dispatch: without an imatrix the _ref path (make_qkx2_quants),
 with one the _impl path (make_qkx3_quants weights + make_qp_quants over the 8 sub-block scales/mins).
 The search loops live in kq_common (Triton on CUDA, eager torch on CPU/MPS).
 """
@@ -16,15 +16,15 @@ from .common import QuantSpec
 from .kq_common import make_qkx_quants, make_qp_quants, qkx_steps
 
 QK_K = 256
-BLOCK_BYTES = 2 + 2 + 12 + QK_K // 2  # fp16 d + fp16 dmin + 6-bit scales + 4-bit quants = 144
+BLOCK_BYTES = 2 + 2 + 12 + QK_K // 8 + QK_K // 2  # fp16 d/dmin + 6-bit scales + qh + qs = 176
 
-_STEPS_REF = qkx_steps(-1.0, 0.1, 20, 15)
-_STEPS_IMPL = qkx_steps(-0.9, 0.05, 36, 15)
+_STEPS_REF = qkx_steps(-0.5, 0.1, 15, 31)
+_STEPS_IMPL = qkx_steps(-0.9, 0.05, 36, 31)
 
 
-def quantize_q4_k(x: torch.Tensor, qw: torch.Tensor | None) -> torch.Tensor:
+def quantize_q5_k(x: torch.Tensor, qw: torch.Tensor | None) -> torch.Tensor:
     """x: (n_rows, k) f32, k % 256 == 0; qw: (k,) f32 imatrix weights or None.
-    Returns (n_rows, k//256 * 144) uint8 on the same device."""
+    Returns (n_rows, k//256 * 176) uint8 on the same device."""
     n, k = x.shape
     ns = n * k // QK_K
     xsb = x.reshape(ns, QK_K)
@@ -33,7 +33,7 @@ def quantize_q4_k(x: torch.Tensor, qw: torch.Tensor | None) -> torch.Tensor:
     if qw is None:
         av_x = torch.sqrt((xg * xg).sum(-1) / 32)
         w = av_x[:, None] + xg.abs()
-        scales, mins, L = make_qkx_quants(xg, w, _STEPS_REF, 15)
+        scales, mins, L = make_qkx_quants(xg, w, _STEPS_REF, 31)
         sc8 = scales.reshape(ns, 8)
         mn8 = mins.reshape(ns, 8)
         max_scale = sc8.max(-1).values
@@ -49,7 +49,7 @@ def quantize_q4_k(x: torch.Tensor, qw: torch.Tensor | None) -> torch.Tensor:
         sigma2 = 2.0 * (xsb * xsb).sum(-1) / QK_K
         qw_sb = qw.reshape(1, k // QK_K, QK_K).expand(n, -1, -1).reshape(ns, QK_K)
         w = (qw_sb * torch.sqrt(sigma2[:, None] + xsb * xsb)).reshape(ns * 8, 32)
-        scales, mins, L = make_qkx_quants(xg, w, _STEPS_IMPL, 15)
+        scales, mins, L = make_qkx_quants(xg, w, _STEPS_IMPL, 31)
         sw = w.sum(-1).reshape(ns, 8)
         d_blk, ls = make_qp_quants(scales.reshape(ns, 8), sw, 63)
         m_blk, lm = make_qp_quants(mins.reshape(ns, 8), sw, 63)
@@ -64,26 +64,29 @@ def quantize_q4_k(x: torch.Tensor, qw: torch.Tensor | None) -> torch.Tensor:
     use = dg != 0
     dsafe = torch.where(use, dg, torch.ones_like(dg))
     x8 = xsb.reshape(ns, 8, 32)
-    lq = torch.round((x8 + mg[..., None]) / dsafe[..., None]).clamp_(0.0, 15.0)
+    lq = torch.round((x8 + mg[..., None]) / dsafe[..., None]).clamp_(0.0, 31.0)
     Lfin = torch.where(use[..., None], lq, L.reshape(ns, 8, 32)).to(torch.int64)
 
-    # pack: qs pairs sub-blocks (2j, 2j+1) as lo | hi << 4; scales/mins use the split 6-bit layout
+    # pack: qs pairs sub-blocks (2j, 2j+1) as lo4 | hi4 << 4; qh[j] holds bit 4 of sub-block s at bit s
     q2 = Lfin.reshape(ns, 4, 2, 32)
-    qs = (q2[:, :, 0, :] | (q2[:, :, 1, :] << 4)).to(torch.uint8).reshape(ns, QK_K // 2)
+    qs = ((q2[:, :, 0, :] & 0xF) | ((q2[:, :, 1, :] & 0xF) << 4)).to(torch.uint8).reshape(ns, QK_K // 2)
+    hb = Lfin >> 4
+    shifts = torch.arange(8, device=x.device, dtype=torch.int64)
+    qh = (hb << shifts[None, :, None]).sum(dim=1).to(torch.uint8)
     b03 = ls[:, :4] | ((ls[:, 4:] >> 4) << 6)
     b47 = lm[:, :4] | ((lm[:, 4:] >> 4) << 6)
     b8b = (ls[:, 4:] & 0xF) | ((lm[:, 4:] & 0xF) << 4)
     scb = torch.cat([b03, b47, b8b], dim=1).to(torch.uint8)
 
-    out = torch.cat([d16[:, None].view(torch.uint8), m16[:, None].view(torch.uint8), scb, qs], dim=1)
+    out = torch.cat([d16[:, None].view(torch.uint8), m16[:, None].view(torch.uint8), scb, qh, qs], dim=1)
     return out.reshape(n, k // QK_K * BLOCK_BYTES)
 
 
 def _make_kernel(device: torch.device, qw) -> callable:
-    return lambda x: quantize_q4_k(x, qw)
+    return lambda x: quantize_q5_k(x, qw)
 
 
 SPECS = {
-    "q4_k": QuantSpec(GGMLQuantizationType.Q4_K, LlamaFileType.MOSTLY_Q4_K_M,
+    "q5_k": QuantSpec(GGMLQuantizationType.Q5_K, LlamaFileType.MOSTLY_Q5_K_M,
                       24, False, _make_kernel, uses_imatrix=True),
 }

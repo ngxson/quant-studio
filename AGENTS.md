@@ -3,6 +3,7 @@
 - Only focus on CUDA performance for now; CPU and MPS are for demo and research purposes
 - Do not write or edit README.md unless explicitly asked by the user
 - Keep the code, comments and docs neutral, do not include machine-specific directory or naming
+- There are some development scripts intended to be used by agents under `tools/dev_*.py`; those are prefixed with `dev_`, targeted to be used by agents, not human
 
 ### Code and Commit Standards
 

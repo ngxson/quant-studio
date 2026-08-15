@@ -415,9 +415,11 @@ def _make_qp_quants(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return torch.where(dead, torch.zeros_like(scale), scale)
 
 
-def quantize_iq2_xxs(x: torch.Tensor, qw: torch.Tensor, T: Tables) -> torch.Tensor:
+def quantize_iq2_xxs(x: torch.Tensor, qw: torch.Tensor, T: Tables | None = None) -> torch.Tensor:
     """x: (n_rows, k) f32, k % 256 == 0; qw: (k,) f32 imatrix weights; returns (n_rows, k//256 * 66) uint8."""
     dev = x.device
+    if T is None:
+        T = tables_for(dev)
     if dev.type == "cuda" and HAS_TRITON:
         return _quantize_cuda(x, qw, T)
 
