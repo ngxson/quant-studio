@@ -5,20 +5,21 @@ Drop-in replacement for `llama-quantize` that does the quantization 100% on GPU 
 Example usage:
 
 ```sh
-python quant-studio.py in.gguf out.gguf q4_0 --mem 4G
+python quant-studio.py in.gguf out.gguf q4_0
 
-python quant-studio.py in.gguf out.gguf q4_k --mem 4G --imatrix imatrix.gguf
+python quant-studio.py in.gguf out.gguf q4_k --imatrix imatrix.gguf
 
-python quant-studio.py in.gguf out.gguf iq2_xxs --mem 4G \
+python quant-studio.py in.gguf out.gguf iq2_xxs \
   --imatrix imatrix.gguf \
   --token-embedding-type q4_0
 
 ```
 
+Most options are the same as `llama-quantize`
+
+Extra options:
 - `--mem` bounds the working set per chunk (`4G`, `512M`, ...)
 - `--device` overrides device selection (`auto`/`cuda`/`mps`/`cpu`)
-- `--imatrix` GGUF importance matrix, required for iq2_xxs; optional for q4_k (used when given, like llama-quantize)
-- `--token-embedding-type` override for token_embd.weight, same as llama-quantize
 
 ## Benchmark
 

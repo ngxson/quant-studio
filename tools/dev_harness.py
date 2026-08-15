@@ -66,7 +66,7 @@ def run_pair(qtype: str, mode: str) -> tuple[Path, Path]:
         raise RuntimeError(f"llama-quantize failed for {qtype} {mode}")
 
     cmd = [sys.executable, str(ROOT / "quant-studio.py"), str(HERE / "synth.gguf"),
-           str(got), qtype, "--mem", "1M", "--device", "cpu"]
+           str(got), lq_name, "--pure", "--mem", "1M", "--device", "cpu"]
     if mode == "imat":
         cmd += ["--imatrix", str(HERE / "synth-imatrix.gguf")]
     r = subprocess.run(cmd, capture_output=True, text=True)

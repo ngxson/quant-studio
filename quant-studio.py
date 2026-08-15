@@ -5,8 +5,9 @@ Streams row chunks from a mmap'd source GGUF, quantizes them on the GPU (CUDA / 
 On CUDA the pipeline is double-buffered with pinned staging: the mmap->RAM copy of the next chunk overlaps the GPU work of the current one, and file writes happen on a separate thread after a CUDA event fires.
 
 Usage:
-    python quant-studio.py in.gguf out.gguf q4_0 --mem 4G
-    python quant-studio.py in.gguf out.gguf iq2_xxs --mem 4G --imatrix imatrix.gguf --token-embedding-type q4_0
+    python quant-studio.py in.gguf out.gguf Q4_K_M --mem 4G --imatrix imatrix.gguf
+    python quant-studio.py in.gguf out.gguf iq2_xxs --pure --mem 4G --imatrix imatrix.gguf --token-embedding-type q4_0
+The scheme mixtures, tensor eligibility rules and fallbacks mirror llama-quantize; see kernels/scheme.py.
 """
 
 from __future__ import annotations
@@ -32,15 +33,7 @@ import gguf
 from gguf import GGMLQuantizationType, GGUFReader, GGUFValueType, GGUFWriter
 from gguf.constants import GGML_QUANT_SIZES, GGML_QUANT_VERSION, LlamaFileType
 
-from kernels import QUANT_TYPES, TORCH_DTYPES
-
-# name-based exclusions from llama-quant.cpp (subset seen so far, extend as needed)
-EXCLUDE_SUBSTRINGS = (
-    "_norm.weight", "ffn_gate_inp.weight", "ffn_gate_tid2eid.weight",
-    "altup", "laurel", "per_layer_model_proj", "ssm_conv1d",
-    "shortconv.conv.weight", "indexer.k_proj.weight", "indexer.q_proj.weight",
-    "time_mix_", "attn_rel_b.weight",
-)
+from kernels import QUANT_TYPES, TORCH_DTYPES, scheme
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -65,15 +58,11 @@ def pick_device(arg: str) -> torch.device:
     return torch.device("cpu")
 
 
-def is_quantizable(tensor: gguf.ReaderTensor) -> bool:
-    """Simplified eligibility rules from llama-quant.cpp; block-size compatibility is checked per target type."""
-    name = tensor.name
-    return (
-        name.endswith("weight")
-        and not any(sub in name for sub in EXCLUDE_SUBSTRINGS)
-        and len(tensor.shape) >= 2
-        and tensor.tensor_type in TORCH_DTYPES
-    )
+def parse_ggml_type(s: str) -> GGMLQuantizationType:
+    try:
+        return GGMLQuantizationType[s.upper()]
+    except KeyError:
+        sys.exit(f"error: unknown ggml type: {s}")
 
 
 def load_imatrix(path: Path) -> dict[str, np.ndarray]:
@@ -276,30 +265,92 @@ def copy_metadata(reader: GGUFReader, writer: GGUFWriter, ftype: LlamaFileType) 
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="GPU-accelerated GGUF quantizer")
-    ap.add_argument("input", type=Path)
-    ap.add_argument("output", type=Path)
-    ap.add_argument("qtype", choices=sorted(QUANT_TYPES), help="target quantization type")
+    ap = argparse.ArgumentParser(
+        description="GPU-accelerated GGUF quantizer, drop-in for llama-quantize",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=scheme.format_scheme_table())
+    ap.add_argument("input", type=Path, help="source GGUF (F32/F16/BF16)")
+    ap.add_argument("output", nargs="?", default=None,
+                    help="output GGUF (default: ggml-model-<TYPE>.gguf next to the input)")
+    ap.add_argument("qtype", nargs="?", default=None, metavar="type",
+                    help="quantization scheme, see the table below")
+    ap.add_argument("nthreads", nargs="?", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--mem", default="4G", help="memory budget per chunk, e.g. 4G / 512M")
     ap.add_argument("--device", default="auto", help="torch device (auto/cuda/mps/cpu)")
-    ap.add_argument("--imatrix", type=Path, default=None,
-                    help="GGUF importance matrix (required for iq2_xxs, used when given for q4_k)")
-    ap.add_argument("--token-embedding-type", choices=sorted(QUANT_TYPES), default=None,
-                    help="override type for token_embd.weight (like llama-quantize)")
+    ap.add_argument("--imatrix", type=Path, default=None, help="GGUF importance matrix")
+    ap.add_argument("--pure", action="store_true",
+                    help="disable k-quant mixtures and quantize all tensors to the same type")
+    ap.add_argument("--leave-output-tensor", action="store_true",
+                    help="leave output.weight un(re)quantized")
+    ap.add_argument("--output-tensor-type", default=None, metavar="ggml_type",
+                    help="use this ggml_type for the output.weight tensor")
+    ap.add_argument("--token-embedding-type", default=None, metavar="ggml_type",
+                    help="use this ggml_type for the token embeddings tensor")
+    ap.add_argument("--tensor-type", action="append", default=[], metavar="name=ggml_type",
+                    help="quantize tensors matching this name regex to this type; repeatable")
+    ap.add_argument("--tensor-type-file", type=Path, default=None, metavar="file",
+                    help="file with name=ggml_type entries, separated by spaces or newlines")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="show the per-tensor plan and final size without quantizing")
+    # llama-quantize options quant-studio recognizes but does not support
+    rej = ap.add_argument_group("rejected llama-quantize options")
+    rej.add_argument("--allow-requantize", action="store_true", help=argparse.SUPPRESS)
+    rej.add_argument("--include-weights", default=None, help=argparse.SUPPRESS)
+    rej.add_argument("--exclude-weights", default=None, help=argparse.SUPPRESS)
+    rej.add_argument("--prune-layers", default=None, help=argparse.SUPPRESS)
+    rej.add_argument("--keep-split", action="store_true", help=argparse.SUPPRESS)
+    rej.add_argument("--override-kv", action="append", default=[], help=argparse.SUPPRESS)
     args = ap.parse_args()
 
-    spec = QUANT_TYPES[args.qtype]
+    for flag, val in (("--allow-requantize", args.allow_requantize),
+                      ("--include-weights", args.include_weights),
+                      ("--exclude-weights", args.exclude_weights),
+                      ("--prune-layers", args.prune_layers),
+                      ("--keep-split", args.keep_split),
+                      ("--override-kv", args.override_kv)):
+        if val:
+            sys.exit(f"error: {flag} is not supported by quant-studio")
+
+    # llama-quantize positional style: the output name may be omitted
+    if args.output is not None and scheme.parse_scheme(args.output) is not None and \
+            (args.qtype is None or args.qtype.isdigit()):
+        args.nthreads = args.qtype
+        args.qtype = args.output
+        args.output = None
+    if args.qtype is None:
+        ap.error("missing quantization type")
+    if args.nthreads is not None:
+        sys.exit("error: the nthreads argument is not supported by quant-studio (GPU pipeline)")
+
+    opt = scheme.parse_scheme(args.qtype)
+    if opt is None:
+        sys.exit(f"error: unknown quantization scheme {args.qtype!r}\n\n" + scheme.format_scheme_table())
+    if not opt.supported:
+        sys.exit(f"error: scheme {opt.name} is not supported by quant-studio\n\n"
+                 + scheme.format_scheme_table())
+    out_path = Path(args.output) if args.output else args.input.parent / f"ggml-model-{opt.name}.gguf"
+
+    tt_entries = list(args.tensor_type)
+    if args.tensor_type_file is not None:
+        tt_entries += args.tensor_type_file.read_text().split()
+    tt_overrides = []
+    for ent in tt_entries:
+        pat, _, tname = ent.partition("=")
+        if not tname:
+            sys.exit(f"error: invalid --tensor-type {ent!r}, expected name=ggml_type")
+        tt_overrides.append((pat, parse_ggml_type(tname)))
+    tet = parse_ggml_type(args.token_embedding_type) if args.token_embedding_type else None
+    ott = parse_ggml_type(args.output_tensor_type) if args.output_tensor_type else None
+
     mem_bytes = parse_mem(args.mem)
     device = pick_device(args.device)
-    print(f"quant-studio: {args.input} -> {args.output} [{args.qtype}] "
+    print(f"quant-studio: {args.input} -> {out_path} [{opt.name}] "
           f"device={device.type} mem={args.mem}")
 
     imatrix: dict[str, np.ndarray] = {}
     if args.imatrix is not None:
         imatrix = load_imatrix(args.imatrix)
         print(f"imatrix: {len(imatrix)} entries from {args.imatrix}")
-    elif spec.needs_imatrix:
-        sys.exit(f"error: {args.qtype} requires --imatrix")
 
     reader = GGUFReader(args.input, mode="r")
     arch_field = reader.get_field(gguf.Keys.General.ARCHITECTURE)
@@ -307,35 +358,66 @@ def main() -> None:
         sys.exit("error: input has no general.architecture key")
     arch = arch_field.contents()
 
-    # decide the target type + kernel for every tensor
-    plans = []  # (tensor, dst_type|None, make_kernel_args|None, bytes_per_elem)
+    # decide the target type + kernel for every tensor with the llama-quant.cpp logic
+    model = scheme.ModelInfo.from_reader(reader)
+    qs = scheme.init_state(model, [t.name for t in reader.tensors], bool(imatrix), tt_overrides)
+    spec_by_type = {s.ggml_type: s for s in QUANT_TYPES.values()}
+
+    plans = []  # (tensor, dst_type|None, spec|None)
+    missing: dict[str, list[str]] = {}
+    need_imat: list[str] = []
     for tensor in reader.tensors:
-        name = tensor.name
-        k = int(tensor.shape[0])
-        dst = None
-        tspec = None
-        if is_quantizable(tensor):
-            tspec = spec
-            if name == "token_embd.weight" and args.token_embedding_type is not None:
-                tspec = QUANT_TYPES[args.token_embedding_type]
-            elif name == "token_embd.weight" and spec.needs_imatrix and name not in imatrix:
-                sys.exit(f"error: {name} has no imatrix entry; pass "
-                         f"--token-embedding-type q4_0 (llama-quantize needs this too)")
-            elif spec.needs_imatrix and name not in imatrix:
-                sys.exit(f"error: missing imatrix entry for {name} "
-                         f"in a very low-bit quantization")
-            block = GGML_QUANT_SIZES[tspec.ggml_type][0]
-            if k % block != 0:
-                if spec.needs_imatrix:
-                    sys.exit(f"error: {name} ncols {k} not divisible by {block} "
-                             f"(type fallback not implemented)")
-                tspec = None  # q4_0 mode: just pass through, matches our old rule
-            if tspec is not None:
-                dst = tspec.ggml_type
+        src = tensor.tensor_type
+        dst = src
+        if src in TORCH_DTYPES:  # requantizing an already-quantized source is rejected above
+            ne = tuple(int(d) for d in tensor.shape)
+            try:
+                dst = scheme.tensor_get_type(
+                    qs, model, tensor.name, ne, src, opt.ftype, pure=args.pure,
+                    quantize_output_tensor=not args.leave_output_tensor,
+                    token_embedding_type=tet, output_tensor_type=ott)
+            except ValueError as e:  # no usable shape fallback: keep the source type
+                print(f"warning: {tensor.name}: {e}; keeping {src.name}", file=sys.stderr)
+        if dst == src:
+            plans.append((tensor, None, None))
+            continue
+        tspec = spec_by_type.get(dst)
+        if tspec is None:
+            missing.setdefault(dst.name, []).append(tensor.name)
+            plans.append((tensor, None, None))
+            continue
+        if (scheme.tensor_requires_imatrix(tensor.name, dst, opt.ftype) or tspec.needs_imatrix) \
+                and tensor.name not in imatrix:
+            need_imat.append(tensor.name)
         plans.append((tensor, dst, tspec))
 
+    if missing:
+        detail = "; ".join(f"{t} for {len(names)} tensors (e.g. {names[0]})"
+                           for t, names in sorted(missing.items()))
+        sys.exit(f"error: this scheme needs kernel types quant-studio does not have yet: {detail}")
+    if need_imat:
+        uniq = sorted(set(need_imat))
+        hint = "" if args.imatrix else " (pass --imatrix)"
+        if "token_embd.weight" in uniq:
+            hint += " (token_embd can be overridden with --token-embedding-type)"
+        sys.exit(f"error: {len(uniq)} tensors require importance matrix data{hint}: "
+                 + ", ".join(uniq[:4]) + ("..." if len(uniq) > 4 else ""))
+
+    if args.dry_run:
+        total_in = total_out = 0
+        for tensor, dst, _tspec in plans:
+            k = int(tensor.shape[0])
+            nbytes = tensor.n_bytes if dst is None else tensor.n_elements // k * out_row_bytes_for(k, dst)
+            total_in += tensor.n_bytes
+            total_out += nbytes
+            print(f"{tensor.name:48s} {tensor.tensor_type.name:>8s} -> "
+                  f"{dst.name if dst else tensor.tensor_type.name:<8s} {fmt_size(nbytes)}")
+        print(f"dry run: {fmt_size(total_in)} -> {fmt_size(total_out)} tensor data "
+              f"({total_out / max(total_in, 1) * 100:.1f}%)")
+        return
+
     writer = GGUFWriter(None, arch=arch)
-    copy_metadata(reader, writer, spec.ftype)
+    copy_metadata(reader, writer, opt.ftype)
 
     # register all tensor infos first (the header needs them before any data)
     for tensor, dst, _tspec in plans:
@@ -349,7 +431,7 @@ def main() -> None:
             writer.add_tensor_info(tensor.name, tensor.data.shape, tensor.data.dtype,
                                    tensor.data.nbytes, raw_dtype=tensor.tensor_type)
 
-    writer.write_header_to_file(path=args.output)
+    writer.write_header_to_file(path=out_path)
     writer.write_kv_data_to_file()
     writer.write_ti_data_to_file()
     fout = writer.fout[0]
