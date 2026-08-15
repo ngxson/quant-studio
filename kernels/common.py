@@ -26,12 +26,15 @@ TORCH_DTYPES = {
 
 class QuantSpec:
     def __init__(self, ggml_type: GGMLQuantizationType, ftype: LlamaFileType,
-                 bytes_per_elem: int, needs_imatrix: bool, make_kernel):
+                 bytes_per_elem: int, needs_imatrix: bool, make_kernel,
+                 uses_imatrix: bool | None = None):
         self.ggml_type = ggml_type
         self.ftype = ftype
         self.bytes_per_elem = bytes_per_elem  # rough full-pipeline working set per element
         self.needs_imatrix = needs_imatrix
         self.make_kernel = make_kernel        # (device, qw_tensor|None) -> fn(x)->uint8
+        # uses one when available even if not required (like the k-quants)
+        self.uses_imatrix = needs_imatrix if uses_imatrix is None else uses_imatrix
 
 
 _compiled: dict[str, object] = {}

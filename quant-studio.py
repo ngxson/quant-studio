@@ -283,8 +283,8 @@ def main() -> None:
     ap.add_argument("--mem", default="4G", help="memory budget per chunk, e.g. 4G / 512M")
     ap.add_argument("--device", default="auto", help="torch device (auto/cuda/mps/cpu)")
     ap.add_argument("--imatrix", type=Path, default=None,
-                    help="GGUF importance matrix (required for iq2_xxs)")
-    ap.add_argument("--token-embedding-type", choices=["q4_0"], default=None,
+                    help="GGUF importance matrix (required for iq2_xxs, used when given for q4_k)")
+    ap.add_argument("--token-embedding-type", choices=sorted(QUANT_TYPES), default=None,
                     help="override type for token_embd.weight (like llama-quantize)")
     args = ap.parse_args()
 
@@ -316,11 +316,11 @@ def main() -> None:
         tspec = None
         if is_quantizable(tensor):
             tspec = spec
-            if name == "token_embd.weight" and spec.needs_imatrix and name not in imatrix:
-                if args.token_embedding_type is None:
-                    sys.exit(f"error: {name} has no imatrix entry; pass "
-                             f"--token-embedding-type q4_0 (llama-quantize needs this too)")
+            if name == "token_embd.weight" and args.token_embedding_type is not None:
                 tspec = QUANT_TYPES[args.token_embedding_type]
+            elif name == "token_embd.weight" and spec.needs_imatrix and name not in imatrix:
+                sys.exit(f"error: {name} has no imatrix entry; pass "
+                         f"--token-embedding-type q4_0 (llama-quantize needs this too)")
             elif spec.needs_imatrix and name not in imatrix:
                 sys.exit(f"error: missing imatrix entry for {name} "
                          f"in a very low-bit quantization")
@@ -367,7 +367,7 @@ def main() -> None:
         out.pad_to_alignment()
         if dst is not None:
             qw = None
-            if tspec.needs_imatrix:
+            if tspec.uses_imatrix and tensor.name in imatrix:
                 qw = torch.from_numpy(imatrix[tensor.name][:k].copy()).to(device)
             quant_fn = tspec.make_kernel(device, qw)
             rows_per_chunk = max(1, mem_bytes // (k * tspec.bytes_per_elem))
