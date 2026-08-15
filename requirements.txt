@@ -1,0 +1,5 @@
+# gguf-py is used from a llama.cpp checkout at ../llama.cpp (or a local gguf-py copy), not from pip
+# triton ships with the torch wheel on Linux/CUDA
+torch>=2.7
+numpy
+pyyaml
