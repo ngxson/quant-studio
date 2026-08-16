@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from .common import HAS_TRITON, F32_TINY, tl, triton
+from .common import HAS_TRITON, F32_TINY, tl, tld, triton
 from .iq2xs_tables import KGRID_2BIT_512, KGRID_2BIT_1024
 
 QK_K = 256
@@ -19,6 +19,23 @@ _TINY = F32_TINY
 
 # id = (2*kMaxQ-1 + is*0.1f)/max for is in -9..9, folded in fp32 like the C code
 SWEEP_CS = [float(np.float32(5.0) + np.float32(s) * np.float32(0.1)) for s in range(-9, 10)]
+
+_steps_cache: dict[str, torch.Tensor] = {}
+
+
+def _steps_for(device: torch.device) -> torch.Tensor:
+    key = str(device)
+    if key not in _steps_cache:
+        _steps_cache[key] = torch.tensor(SWEEP_CS, dtype=torch.float32, device=device)
+    return _steps_cache[key]
+
+
+def tree_sum(t: torch.Tensor) -> torch.Tensor:
+    """Adjacent-pair tree sum over the last dim (power of two); the Triton sweep uses the
+    same association, so the accept chain matches between CPU and CUDA."""
+    while t.shape[-1] > 1:
+        t = t[..., 0::2] + t[..., 1::2]
+    return t[..., 0]
 
 
 class Tables:
@@ -90,6 +107,80 @@ def tables_for(kind: str, device: torch.device) -> Tables:
 
 
 if HAS_TRITON:
+
+    @triton.jit
+    def _pair_add(v, BLOCK: tl.constexpr, M: tl.constexpr):
+        a, b = tl.split(tl.reshape(v, (BLOCK, M, 2)))
+        return tld.add_rn(a, b)
+
+    @triton.jit
+    def _tree16(v, BLOCK: tl.constexpr):
+        """Adjacent-pair tree sum over 16 lanes; add_rn blocks fma contraction, matching tree_sum."""
+        v = _pair_add(v, BLOCK, 8)
+        v = _pair_add(v, BLOCK, 4)
+        v = _pair_add(v, BLOCK, 2)
+        v = _pair_add(v, BLOCK, 1)
+        return tl.reshape(v, (BLOCK,))
+
+    @triton.jit
+    def _codes_kernel(x_ptr, gsafe_ptr, cs_ptr, u_ptr, sc_ptr, G,
+                      S: tl.constexpr, BLOCK: tl.constexpr):
+        """Tentative codes + scales for every sweep step in one pass over xval.
+        Divisions mirror the eager ops: c/gsafe is reciprocal-multiply, 1/inv is a true division."""
+        g = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = g < G
+        a16 = tl.arange(0, 16)[None, :]
+        x = tl.load(x_ptr + g[:, None] * 16 + a16, mask=m[:, None], other=0.0)
+        one = tl.full((BLOCK,), 1.0, tl.float32)
+        r = tld.div_rn(one, tl.load(gsafe_ptr + g, mask=m, other=1.0))
+        sh = 2 * (a16 % 8)
+        half = a16 < 8
+        for s in tl.static_range(0, S):
+            c = tl.load(cs_ptr + s)
+            inv = c * r
+            lev = tl.maximum(tl.minimum(tld.rint(0.5 * (inv[:, None] * x - 1.0)), 2.0), 0.0)
+            bits = lev.to(tl.int32) << sh
+            tl.store(u_ptr + (s * G + g) * 2 + 0, tl.sum(tl.where(half, bits, 0), axis=1), mask=m)
+            tl.store(u_ptr + (s * G + g) * 2 + 1, tl.sum(tl.where(half, 0, bits), axis=1), mask=m)
+            tl.store(sc_ptr + s * G + g, tld.div_rn(one, inv), mask=m)
+
+    @triton.jit
+    def _sweep_kernel(x_ptr, w_ptr, act_ptr, scale0_ptr, win_ptr, og_ptr, code_ptr,
+                      scale_out, win_out, og_out, G,
+                      CODE0: tl.constexpr, S: tl.constexpr, BLOCK: tl.constexpr):
+        """Fused accept chain over the S sweep steps: decode the winners from the code
+        table and carry (scale, best, win, og) in registers instead of eager passes."""
+        g = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = g < G
+        a16 = tl.arange(0, 16)[None, :]
+        x = tl.load(x_ptr + g[:, None] * 16 + a16, mask=m[:, None], other=0.0)
+        w = tl.load(w_ptr + g[:, None] * 16 + a16, mask=m[:, None], other=0.0)
+        act = tl.load(act_ptr + g, mask=m, other=0) != 0
+        scale = tl.load(scale0_ptr + g, mask=m, other=0.0)
+        best = tl.zeros((BLOCK,), tl.float32)
+        a2 = tl.arange(0, 2)[None, :]
+        win = tl.full((BLOCK, 2), CODE0, tl.int32)
+        og = tl.full((BLOCK, 2), 1, tl.int32)
+        tiny = tl.full((1,), 1.1754943508222875e-38, tl.float32)
+        sh = 2 * (a16 % 8)
+        hi = (a16 >= 8).to(tl.int32)
+        for s in tl.static_range(0, S):
+            wi = tl.load(win_ptr + (s * G + g[:, None]) * 2 + hi, mask=m[:, None], other=0)
+            code = tl.load(code_ptr + wi, mask=m[:, None], other=0).to(tl.int32)
+            q = (2 * ((code >> sh) & 3) + 1).to(tl.float32)
+            sumqx = _tree16(w * x * q, BLOCK)
+            sumq2 = _tree16(w * q * q, BLOCK)
+            acc = act & (sumq2 > 0) & (sumqx * sumqx > best * sumq2)
+            ns = tld.div_rn(sumqx, tl.maximum(sumq2, tiny))
+            scale = tl.where(acc, ns, scale)
+            best = tl.where(acc, ns * sumqx, best)
+            w2 = tl.load(win_ptr + (s * G + g[:, None]) * 2 + a2, mask=m[:, None], other=0)
+            o2 = tl.load(og_ptr + (s * G + g[:, None]) * 2 + a2, mask=m[:, None], other=1)
+            win = tl.where(acc[:, None], w2, win)
+            og = tl.where(acc[:, None], o2.to(tl.int32), og)
+        tl.store(scale_out + g, scale, mask=m)
+        tl.store(win_out + g[:, None] * 2 + a2, win, mask=m[:, None])
+        tl.store(og_out + g[:, None] * 2 + a2, og, mask=m[:, None])
 
     @triton.jit
     def _search_kernel(idx_ptr, u_ptr, xv_ptr, wv_ptr, sc_ptr, neigh64_ptr, nlen_ptr,
@@ -197,25 +288,44 @@ def scale_search(xval, w, waux, active, T: Tables):
     wv = waux.reshape(-1, 8)
 
     # the 19 candidate scales depend only on gmax, so all searches batch into one launch
-    invs = [c / gsafe for c in SWEEP_CS]
-    u_all = torch.stack([_codes(xval, inv, T) for inv in invs])
-    sc_all = torch.stack([1.0 / inv for inv in invs])
-    win_all, og_all = search_codes(u_all, xv, wv, sc_all, T)
+    S = len(SWEEP_CS)
+    if dev.type == "cuda" and HAS_TRITON:
+        u_all = torch.empty(S, G, 2, dtype=torch.int32, device=dev)
+        sc_all = torch.empty(S, G, dtype=torch.float32, device=dev)
+        BLOCK = 128
+        grid = ((G + BLOCK - 1) // BLOCK,)
+        _codes_kernel[grid](xval.contiguous(), gsafe, _steps_for(dev), u_all, sc_all, G,
+                            S=S, BLOCK=BLOCK, num_warps=4)
+        win_all, og_all = search_codes(u_all, xv, wv, sc_all, T)
+        scale0 = torch.where(active, gmax / 5.0, torch.zeros_like(gmax))
+        scale = torch.empty_like(scale0)
+        win = torch.empty(G, 2, dtype=torch.int32, device=dev)
+        og8 = torch.empty(G, 2, dtype=torch.int32, device=dev)
+        _sweep_kernel[grid](xval.contiguous(), w.contiguous(), active.to(torch.uint8),
+                            scale0, win_all.contiguous(), og_all.to(torch.uint8).contiguous(),
+                            T.codes, scale, win, og8, G,
+                            CODE0=T.code0, S=S, BLOCK=BLOCK, num_warps=4)
+        og = og8 != 0
+    else:
+        invs = [c / gsafe for c in SWEEP_CS]
+        u_all = torch.stack([_codes(xval, inv, T) for inv in invs])
+        sc_all = torch.stack([1.0 / inv for inv in invs])
+        win_all, og_all = search_codes(u_all, xv, wv, sc_all, T)
 
-    scale = torch.where(active, gmax / 5.0, torch.zeros_like(gmax))
-    best = torch.zeros_like(scale)
-    win = torch.full((G, 2), T.code0, dtype=torch.int32, device=dev)
-    og = torch.ones(G, 2, dtype=torch.bool, device=dev)
-    for st in range(len(SWEEP_CS)):
-        q = T.grid_f[win_all[st].long()].reshape(G, 16)
-        sumqx = (w * xval * q).sum(-1)
-        sumq2 = (w * q * q).sum(-1)
-        acc = active & (sumq2 > 0) & (sumqx * sumqx > best * sumq2)
-        newscale = sumqx / sumq2.clamp(min=_TINY)
-        scale = torch.where(acc, newscale, scale)
-        best = torch.where(acc, newscale * sumqx, best)
-        win = torch.where(acc[:, None], win_all[st], win)
-        og = torch.where(acc[:, None], og_all[st], og)
+        scale = torch.where(active, gmax / 5.0, torch.zeros_like(gmax))
+        best = torch.zeros_like(scale)
+        win = torch.full((G, 2), T.code0, dtype=torch.int32, device=dev)
+        og = torch.ones(G, 2, dtype=torch.bool, device=dev)
+        for st in range(S):
+            q = T.grid_f[win_all[st].long()].reshape(G, 16)
+            sumqx = tree_sum(w * xval * q)
+            sumq2 = tree_sum(w * q * q)
+            acc = active & (sumq2 > 0) & (sumqx * sumqx > best * sumq2)
+            newscale = sumqx / sumq2.clamp(min=_TINY)
+            scale = torch.where(acc, newscale, scale)
+            best = torch.where(acc, newscale * sumqx, best)
+            win = torch.where(acc[:, None], win_all[st], win)
+            og = torch.where(acc[:, None], og_all[st], og)
 
     # re-project only the subgroups that ended off-grid, then refit the scale
     need = active & (scale > 0) & ~og.all(-1)
@@ -226,8 +336,8 @@ def scale_search(xval, w, waux, active, T: Tables):
         win2, _ = search_codes(u2[None], xv, wv, scale[None], T, sel=selm.reshape(1, -1))
         win = torch.where(selm, win2[0], win)
         q = T.grid_f[win.long()].reshape(G, 16)
-        sumqx = (w * xval * q).sum(-1)
-        sumq2 = (w * q * q).sum(-1)
+        sumqx = tree_sum(w * xval * q)
+        sumq2 = tree_sum(w * q * q)
         scale = torch.where(need & (sumq2 > 0), sumqx / sumq2.clamp(min=_TINY), scale)
     return scale, win.long()
 

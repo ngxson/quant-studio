@@ -10,11 +10,20 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from .common import HAS_TRITON, tl, triton
+from .common import HAS_TRITON, F32_TINY, tl, tld, triton
 from .iq3_tables import KGRID_3BIT_256, KGRID_3BIT_512
 
 QK_K = 256
 KMAP_SIZE = 4096
+
+_steps_cache: dict[tuple[str, tuple], torch.Tensor] = {}
+
+
+def steps_for(device: torch.device, steps: list[float]) -> torch.Tensor:
+    key = (str(device), tuple(steps))
+    if key not in _steps_cache:
+        _steps_cache[key] = torch.tensor(steps, dtype=torch.float32, device=device)
+    return _steps_cache[key]
 
 
 class Tables:
@@ -77,6 +86,81 @@ def tables_for(device: torch.device, grid_size: int) -> Tables:
 
 
 if HAS_TRITON:
+
+    @triton.jit
+    def _pair_add(v, BLOCK: tl.constexpr, M: tl.constexpr):
+        a, b = tl.split(tl.reshape(v, (BLOCK, M, 2)))
+        return tld.add_rn(a, b)
+
+    @triton.jit
+    def _tree32(v, BLOCK: tl.constexpr):
+        """Adjacent-pair tree sum over 32 lanes; add_rn blocks fma contraction, matching tree_sum32."""
+        v = _pair_add(v, BLOCK, 16)
+        v = _pair_add(v, BLOCK, 8)
+        v = _pair_add(v, BLOCK, 4)
+        v = _pair_add(v, BLOCK, 2)
+        v = _pair_add(v, BLOCK, 1)
+        return tl.reshape(v, (BLOCK,))
+
+    @triton.jit
+    def _codes_kernel(x_ptr, gsafe_ptr, cs_ptr, u_ptr, sc_ptr, G,
+                      S: tl.constexpr, BLOCK: tl.constexpr):
+        """Tentative 12-bit codes + scales for every sweep step in one pass over xval.
+        Divisions mirror the eager ops: c/gsafe is reciprocal-multiply, 1/inv is a true division."""
+        g = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = g < G
+        a32 = tl.arange(0, 32)[None, :]
+        a8 = tl.arange(0, 8)[None, :]
+        x = tl.load(x_ptr + g[:, None] * 32 + a32, mask=m[:, None], other=0.0)
+        one = tl.full((BLOCK,), 1.0, tl.float32)
+        r = tld.div_rn(one, tl.load(gsafe_ptr + g, mask=m, other=1.0))
+        sh = 3 * (a32 % 4)
+        for s in tl.static_range(0, S):
+            c = tl.load(cs_ptr + s)
+            inv = c * r
+            lev = tl.maximum(tl.minimum(tld.rint(0.5 * (inv[:, None] * x - 1.0)), 7.0), 0.0)
+            bits = tl.reshape(lev.to(tl.int32) << sh, (BLOCK, 8, 4))
+            u = tl.sum(bits, axis=2)
+            tl.store(u_ptr + s * G * 8 + g[:, None] * 8 + a8, u, mask=m[:, None])
+            tl.store(sc_ptr + s * G + g, tld.div_rn(one, inv), mask=m)
+
+    @triton.jit
+    def _sweep_kernel(x_ptr, w_ptr, act_ptr, scale0_ptr, win_ptr, og_ptr, code_ptr,
+                      scale_out, win_out, og_out, G,
+                      OG_INIT: tl.constexpr, S: tl.constexpr, BLOCK: tl.constexpr):
+        """Fused accept chain over the S sweep steps: decode the winners from the code
+        table and carry (scale, best, win, og) in registers instead of eager passes."""
+        g = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = g < G
+        a32 = tl.arange(0, 32)[None, :]
+        a8 = tl.arange(0, 8)[None, :]
+        x = tl.load(x_ptr + g[:, None] * 32 + a32, mask=m[:, None], other=0.0)
+        w = tl.load(w_ptr + g[:, None] * 32 + a32, mask=m[:, None], other=0.0)
+        act = tl.load(act_ptr + g, mask=m, other=0) != 0
+        scale = tl.load(scale0_ptr + g, mask=m, other=0.0)
+        best = tl.zeros((BLOCK,), tl.float32)
+        win = tl.zeros((BLOCK, 8), dtype=tl.int32)
+        og = tl.full((BLOCK, 8), OG_INIT, tl.int32)
+        tiny = tl.full((1,), 1.1754943508222875e-38, tl.float32)
+        sh = 3 * (a32 % 4)
+        sub = a32 // 4
+        for s in tl.static_range(0, S):
+            wi = tl.load(win_ptr + s * G * 8 + g[:, None] * 8 + sub, mask=m[:, None], other=0)
+            code = tl.load(code_ptr + wi, mask=m[:, None], other=0)
+            q = (2 * ((code >> sh) & 7) + 1).to(tl.float32)
+            sumqx = _tree32(w * x * q, BLOCK)
+            sumq2 = _tree32(w * q * q, BLOCK)
+            acc = act & (sumq2 > 0) & (sumqx * sumqx > best * sumq2)
+            ns = tld.div_rn(sumqx, tl.maximum(sumq2, tiny))
+            scale = tl.where(acc, ns, scale)
+            best = tl.where(acc, ns * sumqx, best)
+            w8 = tl.load(win_ptr + s * G * 8 + g[:, None] * 8 + a8, mask=m[:, None], other=0)
+            o8 = tl.load(og_ptr + s * G * 8 + g[:, None] * 8 + a8, mask=m[:, None], other=1)
+            win = tl.where(acc[:, None], w8, win)
+            og = tl.where(acc[:, None], o8.to(tl.int32), og)
+        tl.store(scale_out + g, scale, mask=m)
+        tl.store(win_out + g[:, None] * 8 + a8, win, mask=m[:, None])
+        tl.store(og_out + g[:, None] * 8 + a8, og, mask=m[:, None])
 
     @triton.jit
     def _search_kernel(idx_ptr, u_ptr, xv_ptr, wv_ptr, sc_ptr, neigh64_ptr, nlen_ptr,
@@ -151,12 +235,13 @@ def _search_eager(off: torch.Tensor, u: torch.Tensor, xv, wv, sc_all, win, T: Ta
 
 
 def project(u_all: torch.Tensor, xv: torch.Tensor, wv: torch.Tensor,
-            sc_all: torch.Tensor, T: Tables) -> torch.Tensor:
-    """Winning grid index per (step, subgroup) problem.
+            sc_all: torch.Tensor, T: Tables):
+    """Winning grid index per (step, subgroup) problem, plus the kmap-hit flags.
     u_all: (S, M) clamped 12-bit codes; xv, wv: (M, 4); sc_all: (S, M//8) per-group scales."""
     S, M = u_all.shape
     u = u_all.reshape(-1)
     win = T.kmap[u.long()].to(torch.int32)               # >= 0 iff on-grid
+    og = (win >= 0).reshape(S, M)
     off = (win < 0).nonzero(as_tuple=True)[0]
     if off.numel():
         if u.device.type == "cuda" and HAS_TRITON:
@@ -168,4 +253,27 @@ def project(u_all: torch.Tensor, xv: torch.Tensor, wv: torch.Tensor,
                 GS=T.grid_size, W4=T.neigh64.shape[1], BLOCK=BLOCK, num_warps=4)
         else:
             _search_eager(off, u, xv, wv, sc_all, win, T, M)
-    return win.reshape(S, M)
+    return win.reshape(S, M), og
+
+
+def sweep_fused(xval, w, xv, wv, gsafe, active, scale0, steps, T: Tables, og_init: int):
+    """CUDA fast path: codes for every sweep step, one batched neighbour search,
+    then the fused accept chain. Returns (scale, win (G,8) int32, ongrid (G,8) bool)."""
+    G = xval.shape[0]
+    dev = xval.device
+    S = len(steps)
+    u_all = torch.empty(S, G * 8, dtype=torch.int32, device=dev)
+    sc_all = torch.empty(S, G, dtype=torch.float32, device=dev)
+    BLOCK = 128
+    grid = ((G + BLOCK - 1) // BLOCK,)
+    _codes_kernel[grid](xval.contiguous(), gsafe, steps_for(dev, steps), u_all, sc_all, G,
+                        S=S, BLOCK=BLOCK, num_warps=4)
+    win_all, og_all = project(u_all, xv, wv, sc_all, T)
+    scale = torch.empty(G, dtype=torch.float32, device=dev)
+    win = torch.empty(G, 8, dtype=torch.int32, device=dev)
+    og8 = torch.empty(G, 8, dtype=torch.int32, device=dev)
+    _sweep_kernel[grid](xval.contiguous(), w.contiguous(), active.to(torch.uint8),
+                        scale0.contiguous(), win_all.contiguous(),
+                        og_all.to(torch.uint8).contiguous(), T.codes, scale, win, og8, G,
+                        OG_INIT=og_init, S=S, BLOCK=BLOCK, num_warps=4)
+    return scale, win, og8 != 0

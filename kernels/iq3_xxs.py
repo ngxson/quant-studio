@@ -12,8 +12,8 @@ import torch
 from gguf import GGMLQuantizationType
 from gguf.constants import LlamaFileType
 
-from .common import F32_TINY, QuantSpec
-from .iq3_common import QK_K, project, tables_for, tree_sum32
+from .common import F32_TINY, HAS_TRITON, QuantSpec
+from .iq3_common import QK_K, project, sweep_fused, tables_for, tree_sum32
 
 GROUP_MAX_EPS = 1e-8  # GROUP_MAX_EPS_IQ3_XXS
 BLOCK_BYTES = 2 + 3 * QK_K // 8  # fp16 d + 64 index bytes + 8 sign/scale words = 98
@@ -68,33 +68,36 @@ def quantize_iq3_xxs(x: torch.Tensor, qw: torch.Tensor | None) -> torch.Tensor:
     wv = waux.reshape(-1, 4)
 
     # the 31 candidate scales depend only on the group max, so all searches batch into one launch
-    invs = [c / gsafe for c in _STEPS]
-    u_all = torch.stack([_codes(xval, inv, T.shifts3).reshape(-1) for inv in invs]).to(torch.int32)
-    sc_all = torch.stack([1.0 / inv for inv in invs])
-    win_all = project(u_all, xv, wv, sc_all, T)          # (31, G*8)
-    on_all = T.kmap[u_all.long()] >= 0
+    if dev.type == "cuda" and HAS_TRITON:
+        scale, Wg, ongrid = sweep_fused(xval, w, xv, wv, gsafe, active, gmax / 15.0,
+                                        _STEPS, T, og_init=1)
+    else:
+        invs = [c / gsafe for c in _STEPS]
+        u_all = torch.stack([_codes(xval, inv, T.shifts3).reshape(-1) for inv in invs]).to(torch.int32)
+        sc_all = torch.stack([1.0 / inv for inv in invs])
+        win_all, on_all = project(u_all, xv, wv, sc_all, T)  # (31, G*8)
 
-    scale = gmax / 15.0
-    best = torch.zeros_like(scale)
-    Wg = torch.zeros(G, 8, dtype=torch.int32, device=dev)  # grid entry 0 == all-zero levels
-    ongrid = torch.ones(G, 8, dtype=torch.bool, device=dev)
-    for st in range(len(_STEPS)):
-        win = win_all[st].reshape(G, 8)
-        q = T.grid_f[win.long()].reshape(G, 32)
-        sumqx = tree_sum32(w * xval * q)
-        sumq2 = tree_sum32(w * q * q)
-        acc = active & (sumq2 > 0) & (sumqx * sumqx > best * sumq2)
-        newscale = sumqx / sumq2.clamp(min=_TINY)
-        scale = torch.where(acc, newscale, scale)
-        best = torch.where(acc, newscale * sumqx, best)
-        Wg = torch.where(acc[:, None], win, Wg)
-        ongrid = torch.where(acc[:, None], on_all[st].reshape(G, 8), ongrid)
+        scale = gmax / 15.0
+        best = torch.zeros_like(scale)
+        Wg = torch.zeros(G, 8, dtype=torch.int32, device=dev)  # grid entry 0 == all-zero levels
+        ongrid = torch.ones(G, 8, dtype=torch.bool, device=dev)
+        for st in range(len(_STEPS)):
+            win = win_all[st].reshape(G, 8)
+            q = T.grid_f[win.long()].reshape(G, 32)
+            sumqx = tree_sum32(w * xval * q)
+            sumq2 = tree_sum32(w * q * q)
+            acc = active & (sumq2 > 0) & (sumqx * sumqx > best * sumq2)
+            newscale = sumqx / sumq2.clamp(min=_TINY)
+            scale = torch.where(acc, newscale, scale)
+            best = torch.where(acc, newscale * sumqx, best)
+            Wg = torch.where(acc[:, None], win, Wg)
+            ongrid = torch.where(acc[:, None], on_all[st].reshape(G, 8), ongrid)
 
     # only off-grid subgroups reproject with the accepted scale, then one least-squares refit
     redo = active & ongrid.logical_not().any(-1) & (scale > 0)
     inv2 = 1.0 / torch.where(redo, scale, torch.ones_like(scale))
     u2 = _codes(xval, inv2, T.shifts3).reshape(1, -1).to(torch.int32)
-    win2 = project(u2, xv, wv, scale.reshape(1, G), T).reshape(G, 8)
+    win2 = project(u2, xv, wv, scale.reshape(1, G), T)[0].reshape(G, 8)
     Wg = torch.where(redo[:, None] & ~ongrid, win2, Wg)
     q = T.grid_f[Wg.long()].reshape(G, 32)
     sumqx = tree_sum32(w * xval * q)
