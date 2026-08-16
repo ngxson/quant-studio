@@ -8,7 +8,7 @@ from pathlib import Path
 # the kernels need the llama.cpp fork's gguf-py; prefer it over any installed gguf
 if "gguf" not in sys.modules:
     _root = Path(__file__).resolve().parent.parent
-    for _p in (_root / "gguf-py", _root.parent / "llama.cpp" / "gguf-py"):
+    for _p in (_root / "gguf-py", _root / "llama.cpp" / "gguf-py", _root.parent / "llama.cpp" / "gguf-py"):
         if _p.is_dir():
             sys.path.insert(0, str(_p))
             break

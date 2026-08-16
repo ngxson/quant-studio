@@ -22,8 +22,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# use a local gguf-py copy if present, else the llama.cpp checkout next to this repo
+# use a local gguf-py copy if present, else the llama.cpp submodule or a sibling checkout
 for _p in (Path(__file__).parent / "gguf-py",
+           Path(__file__).parent / "llama.cpp" / "gguf-py",
            Path(__file__).parent / ".." / "llama.cpp" / "gguf-py"):
     if _p.is_dir():
         sys.path.insert(0, str(_p.resolve()))
@@ -33,7 +34,7 @@ import gguf
 from gguf import GGMLQuantizationType, GGUFReader, GGUFValueType, GGUFWriter
 from gguf.constants import GGML_QUANT_SIZES, GGML_QUANT_VERSION, LlamaFileType
 
-from kernels import QUANT_TYPES, TORCH_DTYPES, scheme
+from kernels import QUANT_TYPES, TORCH_DTYPES, adaround, scheme
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -278,6 +279,9 @@ def main() -> None:
     ap.add_argument("--mem", default="4G", help="memory budget per chunk, e.g. 4G / 512M")
     ap.add_argument("--device", default="auto", help="torch device (auto/cuda/mps/cpu)")
     ap.add_argument("--imatrix", type=Path, default=None, help="GGUF importance matrix")
+    ap.add_argument("--ada", type=Path, default=None, metavar="gmatrix",
+                    help="AdaRound: optimize weight rounding against this gmatrix file (see cpp/gmatrix.cpp); Q4_0 tensors only")
+    ap.add_argument("--ada-iters", type=int, default=500, help="AdaRound optimization steps per chunk")
     ap.add_argument("--pure", action="store_true",
                     help="disable k-quant mixtures and quantize all tensors to the same type")
     ap.add_argument("--leave-output-tensor", action="store_true",
@@ -351,6 +355,11 @@ def main() -> None:
     if args.imatrix is not None:
         imatrix = load_imatrix(args.imatrix)
         print(f"imatrix: {len(imatrix)} entries from {args.imatrix}")
+
+    gram = None
+    if args.ada is not None:
+        gram = adaround.GramFile(args.ada)
+        print(f"gmatrix: {len(gram)} entries from {args.ada}")
 
     reader = GGUFReader(args.input, mode="r")
     arch_field = reader.get_field(gguf.Keys.General.ARCHITECTURE)
@@ -449,11 +458,19 @@ def main() -> None:
         k = int(tensor.shape[0])
 
         out.pad_to_alignment()
+        ada = False
         if dst is not None:
             qw = None
             if tspec.uses_imatrix and tensor.name in imatrix:
                 qw = torch.from_numpy(imatrix[tensor.name][:k].copy()).to(device)
-            quant_fn = tspec.make_kernel(device, qw)
+            if gram is not None and dst == GGMLQuantizationType.Q4_0:
+                if tensor.name in gram:
+                    quant_fn = adaround.make_q4_0_kernel(gram.load(tensor.name, device), iters=args.ada_iters)
+                    ada = True
+                else:
+                    print(f"warning: {tensor.name}: no gmatrix entry, using plain rounding", file=sys.stderr)
+            if not ada:
+                quant_fn = tspec.make_kernel(device, qw)
             rows_per_chunk = max(1, mem_bytes // (k * tspec.bytes_per_elem))
             if pipeline is not None:
                 nbytes = pipeline.quantize_tensor(tensor, quant_fn, dst, rows_per_chunk)
@@ -463,8 +480,9 @@ def main() -> None:
             nbytes = copy_tensor(tensor, mem_bytes, out)
         total_in += tensor.n_bytes
         total_out += nbytes
+        dst_str = (dst.name if dst else src) + ("+ada" if ada else "")
         print(f"[{i + 1:4d}/{len(plans)}] {tensor.name:48s} {shape_str:>16s}  "
-              f"{src:>5s} -> {dst.name if dst else src:<8s} "
+              f"{src:>5s} -> {dst_str:<8s} "
               f"{fmt_size(tensor.n_bytes)} -> {fmt_size(nbytes)}")
 
     out.pad_to_alignment()
