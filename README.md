@@ -51,6 +51,8 @@ Test input: `Qwen3.5-4B-BF16.gguf`
 - All runs use the same imatrix, except (*) Q4_0 which runs without one: imatrix quantizes ffn_down to Q4_1, but quant-studio hasn't yet supported Q4_1.
 - The non-identical blocks are ULP-level tie-breaks with equal or better weighted MSE.
 
+For quality test, see [docs/ppl.md](docs/ppl.md)
+
 ---
 
 `--pure` results (used during development)
